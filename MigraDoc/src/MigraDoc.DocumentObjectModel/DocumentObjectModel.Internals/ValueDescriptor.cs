@@ -33,6 +33,7 @@
 using System;
 using System.Diagnostics;
 using System.Reflection;
+using System.Reflection.Emit;
 
 #pragma warning disable 1591
 
@@ -43,6 +44,12 @@ namespace MigraDoc.DocumentObjectModel.Internals
     /// </summary>
     public abstract class ValueDescriptor
     {
+        private ValueGetter _valueGetter;
+        private ValueSetter _valueSetter;
+
+        private delegate object ValueGetter(DocumentObject dom);
+        private delegate void ValueSetter(DocumentObject dom, object value);
+
         internal ValueDescriptor(string valueName, Type valueType, Type memberType, MemberInfo memberInfo, VDFlags flags)
         {
             // Take new naming convention into account.
@@ -58,19 +65,7 @@ namespace MigraDoc.DocumentObjectModel.Internals
 
         public object CreateValue()
         {
-#if !NETFX_CORE
-            ConstructorInfo constructorInfo = ValueType.GetConstructor(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic, null, Type.EmptyTypes, null);
-#else
-            var constructorInfos = ValueType.GetTypeInfo().DeclaredConstructors;
-            ConstructorInfo constructorInfo = null;
-            foreach (var info in constructorInfos)
-            {
-                if (info.GetParameters().Length == 0)
-                    constructorInfo = info;
-            }
-#endif
-            Debug.Assert(constructorInfo != null);
-            return constructorInfo.Invoke(null);
+            return Activator.CreateInstance(ValueType, true);
         }
 
         public abstract object GetValue(DocumentObject dom, GV flags);
@@ -140,6 +135,93 @@ namespace MigraDoc.DocumentObjectModel.Internals
             return null;
         }
 
+        protected void InternalSetValue(DocumentObject dom, object value)
+        {
+            if (_valueSetter == null)
+                _valueSetter = CreateValueSetter();
+
+            _valueSetter(dom, value);
+        }
+
+        protected object InternalGetValue(DocumentObject dom)
+        {
+            if (_valueGetter == null)
+                _valueGetter = CreateValueGetter();
+
+            return _valueGetter(dom);
+        }
+
+        private ValueSetter CreateValueSetter()
+        {
+            string methodName = MemberInfo.ReflectedType.FullName + ".set_" + MemberInfo.Name;
+            DynamicMethod getterMethod = new DynamicMethod(methodName, null, new[] { typeof(DocumentObject), typeof(object) }, true);
+            ILGenerator gen = getterMethod.GetILGenerator();
+
+            gen.Emit(OpCodes.Ldarg_0); // Load DocumentObject
+            gen.Emit(OpCodes.Castclass, MemberInfo.ReflectedType);
+            gen.Emit(OpCodes.Ldarg_1); // Load value
+
+            FieldInfo field = FieldInfo;
+
+            if (field != null)
+            {
+                if (field.FieldType.IsValueType)
+                    gen.Emit(OpCodes.Unbox_Any, field.FieldType);
+                else if (field.FieldType != typeof(object))
+                    gen.Emit(OpCodes.Castclass, field.FieldType);
+
+                gen.Emit(OpCodes.Stfld, field);
+            }
+            else
+            {
+                PropertyInfo property = PropertyInfo;
+
+                if (property.PropertyType.IsValueType)
+                    gen.Emit(OpCodes.Unbox_Any, property.PropertyType);
+                else if (property.PropertyType != typeof(object))
+                    gen.Emit(OpCodes.Castclass, property.PropertyType);
+
+                gen.Emit(OpCodes.Callvirt, property.GetSetMethod(true));
+            }
+
+            gen.Emit(OpCodes.Ret);
+
+            return (ValueSetter)getterMethod.CreateDelegate(typeof(ValueSetter));
+        }
+
+        private ValueGetter CreateValueGetter()
+        {
+            string methodName = MemberInfo.ReflectedType.FullName + ".get_" + MemberInfo.Name;
+            DynamicMethod getterMethod = new DynamicMethod(methodName, typeof(object), new[] { typeof(DocumentObject) }, true);
+            ILGenerator gen = getterMethod.GetILGenerator();
+
+            gen.Emit(OpCodes.Ldarg_0); // Load DocumentObject
+            gen.Emit(OpCodes.Castclass, MemberInfo.ReflectedType);
+
+            FieldInfo field = FieldInfo;
+
+            if (field != null)
+            {
+                gen.Emit(OpCodes.Ldfld, field);
+
+                if (field.FieldType.IsValueType)
+                    gen.Emit(OpCodes.Box, field.FieldType);
+            }
+            else
+            {
+                PropertyInfo property = PropertyInfo;
+
+                gen.Emit(OpCodes.Callvirt, property.GetGetMethod(true));
+
+                if (PropertyInfo.PropertyType.IsValueType)
+                    gen.Emit(OpCodes.Box, property.PropertyType);
+            }
+
+            gen.Emit(OpCodes.Ret);
+
+            return (ValueGetter)getterMethod.CreateDelegate(typeof(ValueGetter));
+        }
+
         public bool IsRefOnly
         {
             get { return (_flags & VDFlags.RefOnly) == VDFlags.RefOnly; }
@@ -192,14 +274,9 @@ namespace MigraDoc.DocumentObjectModel.Internals
 
         public override object GetValue(DocumentObject dom, GV flags)
         {
-            if (!Enum.IsDefined(typeof(GV), flags))
-                throw new /*InvalidEnum*/ArgumentException(DomSR.InvalidEnumValue(flags), "flags");
+            Debug.Assert(Enum.IsDefined(typeof(GV), flags), DomSR.InvalidEnumValue(flags));
 
-#if !NETFX_CORE
-            object val = FieldInfo != null ? FieldInfo.GetValue(dom) : PropertyInfo.GetGetMethod(true).Invoke(dom, null);
-#else
-            object val = FieldInfo != null ? FieldInfo.GetValue(dom) : PropertyInfo.GetValue(dom);
-#endif
+            object val = InternalGetValue(dom);
             INullableValue ival = (INullableValue)val;
             if (ival.IsNull && flags == GV.GetNull)
                 return null;
@@ -208,58 +285,20 @@ namespace MigraDoc.DocumentObjectModel.Internals
 
         public override void SetValue(DocumentObject dom, object value)
         {
-            object val;
-            INullableValue ival;
-            if (FieldInfo != null)
-            {
-                val = FieldInfo.GetValue(dom);
-                ival = (INullableValue)val;
-                ival.SetValue(value);
-                FieldInfo.SetValue(dom, ival);
-            }
-            else
-            {
-#if !NETFX_CORE
-                val = PropertyInfo.GetGetMethod(true).Invoke(dom, null);
-#else
-                val = PropertyInfo.GetValue(dom);
-#endif
-                ival = (INullableValue)val;
-                ival.SetValue(value);
-#if !NETFX_CORE
-                PropertyInfo.GetSetMethod(true).Invoke(dom, new object[] { ival });
-#else
-                PropertyInfo.SetValue(dom, ival);
-#endif
-            }
+            object val = InternalGetValue(dom);
+            INullableValue ival = (INullableValue)val;
+
+            ival.SetValue(value);
+            InternalSetValue(dom, ival);
         }
 
         public override void SetNull(DocumentObject dom)
         {
-            object val;
-            INullableValue ival;
-            if (FieldInfo != null)
-            {
-                val = FieldInfo.GetValue(dom);
-                ival = (INullableValue)val;
-                ival.SetNull();
-                FieldInfo.SetValue(dom, ival);
-            }
-            else
-            {
-#if !NETFX_CORE
-                val = PropertyInfo.GetGetMethod(true).Invoke(dom, null);
-#else
-                val = PropertyInfo.GetValue(dom);
-#endif
-                ival = (INullableValue)val;
-                ival.SetNull();
-#if !NETFX_CORE
-                PropertyInfo.GetSetMethod(true).Invoke(dom, new object[] { ival });
-#else
-                PropertyInfo.SetValue(dom, ival);
-#endif
-            }
+            object val = InternalGetValue(dom);
+            INullableValue ival = (INullableValue)val;
+
+            ival.SetNull();
+            InternalSetValue(dom, ival);
         }
 
         /// <summary>
@@ -267,11 +306,8 @@ namespace MigraDoc.DocumentObjectModel.Internals
         /// </summary>
         public override bool IsNull(DocumentObject dom)
         {
-#if !NETFX_CORE
-            object val = FieldInfo != null ? FieldInfo.GetValue(dom) : PropertyInfo.GetGetMethod(true).Invoke(dom, null);
-#else
-            object val = FieldInfo != null ? FieldInfo.GetValue(dom) : PropertyInfo.GetValue(dom);
-#endif
+            object val = InternalGetValue(dom);
+
             return ((INullableValue)val).IsNull;
         }
     }
@@ -287,14 +323,9 @@ namespace MigraDoc.DocumentObjectModel.Internals
 
         public override object GetValue(DocumentObject dom, GV flags)
         {
-            if (!Enum.IsDefined(typeof(GV), flags))
-                throw new /*InvalidEnum*/ArgumentException(DomSR.InvalidEnumValue(flags), "flags");
+            Debug.Assert(Enum.IsDefined(typeof(GV), flags), DomSR.InvalidEnumValue(flags));
 
-#if !NETFX_CORE
-            object val = FieldInfo != null ? FieldInfo.GetValue(dom) : PropertyInfo.GetGetMethod(true).Invoke(dom, null);
-#else
-            object val = FieldInfo != null ? FieldInfo.GetValue(dom) : PropertyInfo.GetValue(dom);
-#endif
+            object val = InternalGetValue(dom);
             INullableValue ival = val as INullableValue;
             if (ival != null && ival.IsNull && flags == GV.GetNull)
                 return null;
@@ -303,42 +334,16 @@ namespace MigraDoc.DocumentObjectModel.Internals
 
         public override void SetValue(DocumentObject dom, object value)
         {
-            if (FieldInfo != null)
-                FieldInfo.SetValue(dom, value);
-            else
-#if !NETFX_CORE
-                PropertyInfo.GetSetMethod(true).Invoke(dom, new object[] { value });
-#else
-                PropertyInfo.SetValue(dom, value);
-#endif
+            InternalSetValue(dom, value);
         }
 
         public override void SetNull(DocumentObject dom)
         {
-            object val;
-            INullableValue ival;
-            if (FieldInfo != null)
-            {
-                val = FieldInfo.GetValue(dom);
-                ival = (INullableValue)val;
-                ival.SetNull();
-                FieldInfo.SetValue(dom, ival);
-            }
-            else
-            {
-#if !NETFX_CORE
-                val = PropertyInfo.GetGetMethod(true).Invoke(dom, null);
-#else
-                val = PropertyInfo.GetValue(dom);
-#endif
-                ival = (INullableValue)val;
-                ival.SetNull();
-#if !NETFX_CORE
-                PropertyInfo.GetSetMethod(true).Invoke(dom, new object[] { ival });
-#else
-                PropertyInfo.SetValue(dom, ival);
-#endif
-            }
+            object val = InternalGetValue(dom);
+            INullableValue ival = (INullableValue)val;
+
+            ival.SetNull();
+            InternalSetValue(dom, ival);
         }
 
         /// <summary>
@@ -346,11 +351,7 @@ namespace MigraDoc.DocumentObjectModel.Internals
         /// </summary>
         public override bool IsNull(DocumentObject dom)
         {
-#if !NETFX_CORE
-            object val = FieldInfo != null ? FieldInfo.GetValue(dom) : PropertyInfo.GetGetMethod(true).Invoke(dom, null);
-#else
-            object val = FieldInfo != null ? FieldInfo.GetValue(dom) : PropertyInfo.GetValue(dom);
-#endif
+            object val = InternalGetValue(dom);
             INullableValue ival = val as INullableValue;
             if (ival != null)
                 return ival.IsNull;
@@ -369,32 +370,22 @@ namespace MigraDoc.DocumentObjectModel.Internals
 
         public override object GetValue(DocumentObject dom, GV flags)
         {
-            if (!Enum.IsDefined(typeof(GV), flags))
-                throw new /*InvalidEnum*/ArgumentException(DomSR.InvalidEnumValue(flags), "flags");
+            Debug.Assert(Enum.IsDefined(typeof(GV), flags), DomSR.InvalidEnumValue(flags));
 
-            FieldInfo fieldInfo = FieldInfo;
-            DocumentObject val;
-            if (fieldInfo != null)
+            DocumentObject val = InternalGetValue(dom) as DocumentObject;
+
+            if (FieldInfo != null)
             {
                 // Member is a field
-                val = FieldInfo.GetValue(dom) as DocumentObject;
                 if (val == null && flags == GV.ReadWrite)
                 {
                     val = (DocumentObject)CreateValue();
                     val._parent = dom;
-                    FieldInfo.SetValue(dom, val);
+                    InternalSetValue(dom, val);
                     return val;
                 }
             }
-            else
-            {
-                // Member is a property
-#if !NETFX_CORE
-                val = PropertyInfo.GetGetMethod(true).Invoke(dom, null) as DocumentObject;
-#else
-                val = PropertyInfo.GetValue(dom) as DocumentObject;
-#endif
-            }
+            // Member is property
             if (val != null && (val.IsNull() && flags == GV.GetNull))
                 return null;
 
@@ -407,7 +398,7 @@ namespace MigraDoc.DocumentObjectModel.Internals
             // Member is a field
             if (fieldInfo != null)
             {
-                fieldInfo.SetValue(dom, val);
+                InternalSetValue(dom, val);
                 return;
             }
             throw new InvalidOperationException("This value cannot be set.");
@@ -415,28 +406,10 @@ namespace MigraDoc.DocumentObjectModel.Internals
 
         public override void SetNull(DocumentObject dom)
         {
-            FieldInfo fieldInfo = FieldInfo;
-            DocumentObject val;
-            // Member is a field.
-            if (fieldInfo != null)
-            {
-                val = FieldInfo.GetValue(dom) as DocumentObject;
-                if (val != null)
-                    val.SetNull();
-            }
+            DocumentObject val = InternalGetValue(dom) as DocumentObject;
 
-            // Member is a property.
-            if (PropertyInfo != null)
-            {
-                PropertyInfo propInfo = PropertyInfo;
-#if !NETFX_CORE
-                val = propInfo.GetGetMethod(true).Invoke(dom, null) as DocumentObject;
-#else
-                val = propInfo.GetValue(dom) as DocumentObject;
-#endif
-                if (val != null)
-                    val.SetNull();
-            }
+            if (val != null)
+                val.SetNull();
         }
 
         /// <summary>
@@ -444,26 +417,9 @@ namespace MigraDoc.DocumentObjectModel.Internals
         /// </summary>
         public override bool IsNull(DocumentObject dom)
         {
-            FieldInfo fieldInfo = FieldInfo;
-            DocumentObject val;
-            // Member is a field
-            if (fieldInfo != null)
-            {
-                val = FieldInfo.GetValue(dom) as DocumentObject;
-                if (val == null)
-                    return true;
-                return val.IsNull();
-            }
-            // Member is a property
-            PropertyInfo propInfo = PropertyInfo;
-#if !NETFX_CORE
-            val = propInfo.GetGetMethod(true).Invoke(dom, null) as DocumentObject;
-#else
-            val = propInfo.GetValue(dom) as DocumentObject;
-#endif
-            if (val != null)
-                val.IsNull();
-            return true;
+            DocumentObject val = InternalGetValue(dom) as DocumentObject;
+
+            return val == null || val.IsNull();
         }
     }
 
@@ -478,16 +434,15 @@ namespace MigraDoc.DocumentObjectModel.Internals
 
         public override object GetValue(DocumentObject dom, GV flags)
         {
-            if (!Enum.IsDefined(typeof(GV), flags))
-                throw new /*InvalidEnum*/ArgumentException(DomSR.InvalidEnumValue(flags), "flags");
+            Debug.Assert(Enum.IsDefined(typeof(GV), flags), DomSR.InvalidEnumValue(flags));
 
             Debug.Assert(MemberInfo is FieldInfo, "Properties of DocumentObjectCollection not allowed.");
-            DocumentObjectCollection val = FieldInfo.GetValue(dom) as DocumentObjectCollection;
+            DocumentObjectCollection val = InternalGetValue(dom) as DocumentObjectCollection;
             if (val == null && flags == GV.ReadWrite)
             {
                 val = (DocumentObjectCollection)CreateValue();
                 val._parent = dom;
-                FieldInfo.SetValue(dom, val);
+                InternalSetValue(dom, val);
                 return val;
             }
             if (val != null && val.IsNull() && flags == GV.GetNull)
@@ -497,12 +452,12 @@ namespace MigraDoc.DocumentObjectModel.Internals
 
         public override void SetValue(DocumentObject dom, object val)
         {
-            FieldInfo.SetValue(dom, val);
+            InternalSetValue(dom, val);
         }
 
         public override void SetNull(DocumentObject dom)
         {
-            DocumentObjectCollection val = FieldInfo.GetValue(dom) as DocumentObjectCollection;
+            DocumentObjectCollection val = InternalGetValue(dom) as DocumentObjectCollection;
             if (val != null)
                 val.SetNull();
         }
@@ -512,7 +467,7 @@ namespace MigraDoc.DocumentObjectModel.Internals
         /// </summary>
         public override bool IsNull(DocumentObject dom)
         {
-            DocumentObjectCollection val = FieldInfo.GetValue(dom) as DocumentObjectCollection;
+            DocumentObjectCollection val = InternalGetValue(dom) as DocumentObjectCollection;
             if (val == null)
                 return true;
             return val.IsNull();
